@@ -86,3 +86,4 @@ the check passes again, the workflow comments on and closes that issue.
 - This intentionally follows an install mode that upstream Nix no longer
   supports on macOS. Use at your own risk.
 - The manual commands above require `curl`, `tar`, `patch`, and `shasum`.
+* Generate a new patch by running: `git diff --relative install > no-daemon.patch` from inside the release directory.
