@@ -1,0 +1,293 @@
+name: Check patch
+
+on:
+  schedule:
+    - cron: "23 9 * * *"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: check-patch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check patch against Nix installer
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Choose latest Nix release
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          system="aarch64-darwin"
+          tags_json="$RUNNER_TEMP/nix-tags.json"
+
+          curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/NixOS/nix/tags?per_page=100" \
+            -o "$tags_json"
+
+          mapfile -t versions < <(python3 - "$tags_json" <<'PY'
+          import json
+          import re
+          import sys
+
+          with open(sys.argv[1], "r", encoding="utf-8") as f:
+              tags = json.load(f)
+
+          versions = []
+          for tag in tags:
+              name = tag["name"].removeprefix("nix-").removeprefix("v")
+              if re.fullmatch(r"\d+\.\d+\.\d+", name):
+                  versions.append(name)
+
+          versions.sort(key=lambda v: tuple(map(int, v.split("."))), reverse=True)
+          print("\n".join(versions))
+          PY
+          )
+
+          version=""
+          url=""
+          for candidate in "${versions[@]}"; do
+            candidate_url="https://releases.nixos.org/nix/nix-$candidate/nix-$candidate-$system.tar.xz"
+            if curl -fsI "$candidate_url" >/dev/null; then
+              version="$candidate"
+              url="$candidate_url"
+              break
+            fi
+          done
+
+          if [[ -z "$version" ]]; then
+            echo "Could not find a published Nix tarball for $system" >&2
+            exit 1
+          fi
+
+          sha256="$(curl -fsSL "$url.sha256" | awk '{print $1}')"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "system=$system" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+          echo "Latest published Nix tarball for $system: $version"
+          echo "$url"
+          echo "sha256=$sha256"
+
+      - name: Restore successful-check marker
+        id: check-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .patch-check-state
+          key: nix-no-daemon-patch-ok-${{ steps.target.outputs.system }}-${{ steps.target.outputs.version }}-${{ steps.target.outputs.sha256 }}-${{ hashFiles('no-daemon.patch') }}
+
+      - name: Already checked this release
+        if: steps.check-cache.outputs.cache-hit == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          SYSTEM: ${{ steps.target.outputs.system }}
+          URL: ${{ steps.target.outputs.url }}
+          TARBALL_SHA256: ${{ steps.target.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          echo "Nix $VERSION for $SYSTEM has already passed for this patch."
+          test ! -f .patch-check-state/checked.txt || cat .patch-check-state/checked.txt
+
+          {
+            echo "## Patch check"
+            echo
+            echo "Skipped tarball download/check because this exact tarball and patch already passed."
+            echo
+            echo "- Nix: $VERSION"
+            echo "- System: $SYSTEM"
+            echo "- Tarball: $URL"
+            echo "- Tarball SHA-256: $TARBALL_SHA256"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download and verify tarball
+        if: steps.check-cache.outputs.cache-hit != 'true'
+        id: download
+        env:
+          URL: ${{ steps.target.outputs.url }}
+          EXPECTED_SHA256: ${{ steps.target.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          tarball="$RUNNER_TEMP/$(basename "$URL")"
+          curl -fL "$URL" -o "$tarball"
+
+          actual="$(sha256sum "$tarball" | awk '{print $1}')"
+
+          if [[ "$actual" != "$EXPECTED_SHA256" ]]; then
+            echo "Checksum mismatch" >&2
+            echo "expected: $EXPECTED_SHA256" >&2
+            echo "actual:   $actual" >&2
+            exit 1
+          fi
+
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$actual" >> "$GITHUB_OUTPUT"
+
+      - name: Check patch applies cleanly
+        id: patch
+        if: steps.check-cache.outputs.cache-hit != 'true'
+        env:
+          TARBALL: ${{ steps.download.outputs.tarball }}
+          TARBALL_SHA256: ${{ steps.download.outputs.sha256 }}
+          VERSION: ${{ steps.target.outputs.version }}
+          SYSTEM: ${{ steps.target.outputs.system }}
+          URL: ${{ steps.target.outputs.url }}
+        run: |
+          set -euo pipefail
+
+          extract_dir="$RUNNER_TEMP/extract"
+          mkdir -p "$extract_dir"
+          tar -xf "$TARBALL" -C "$extract_dir"
+
+          installer_dir="$extract_dir/nix-$VERSION-$SYSTEM"
+          test -x "$installer_dir/install"
+
+          patch --dry-run -F 0 -d "$installer_dir" -p1 < no-daemon.patch
+
+          mkdir -p .patch-check-state
+          {
+            echo "version=$VERSION"
+            echo "system=$SYSTEM"
+            echo "url=$URL"
+            echo "tarball_sha256=$TARBALL_SHA256"
+            echo "patch_sha256=$(sha256sum no-daemon.patch | awk '{print $1}')"
+            echo "checked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > .patch-check-state/checked.txt
+
+          {
+            echo "## Patch check"
+            echo
+            echo "Patch applies cleanly with zero fuzz."
+            echo
+            echo "- Nix: $VERSION"
+            echo "- System: $SYSTEM"
+            echo "- Tarball: $URL"
+            echo "- Tarball SHA-256: $TARBALL_SHA256"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save successful-check marker
+        if: steps.check-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .patch-check-state
+          key: nix-no-daemon-patch-ok-${{ steps.target.outputs.system }}-${{ steps.target.outputs.version }}-${{ steps.target.outputs.sha256 }}-${{ hashFiles('no-daemon.patch') }}
+
+      - name: Close failure issue when patch check passes
+        if: success()
+        uses: actions/github-script@v7
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          SYSTEM: ${{ steps.target.outputs.system }}
+          URL: ${{ steps.target.outputs.url }}
+          TARBALL_SHA256: ${{ steps.target.outputs.sha256 }}
+        with:
+          script: |
+            const marker = '<!-- nix-no-daemon-patch-failed -->';
+            const { owner, repo } = context.repo;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            const matchingIssues = issues.filter((issue) =>
+              !issue.pull_request && issue.body?.includes(marker)
+            );
+
+            for (const issue of matchingIssues) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: [
+                  'Patch check is passing again.',
+                  '',
+                  `- Nix: ${process.env.VERSION}`,
+                  `- System: ${process.env.SYSTEM}`,
+                  `- Tarball: ${process.env.URL}`,
+                  `- Tarball SHA-256: ${process.env.TARBALL_SHA256}`,
+                ].join('\n'),
+              });
+
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+            }
+
+      - name: Open issue when patch no longer applies
+        if: failure() && steps.patch.outcome == 'failure'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          SYSTEM: ${{ steps.target.outputs.system }}
+          URL: ${{ steps.target.outputs.url }}
+          TARBALL_SHA256: ${{ steps.target.outputs.sha256 }}
+        with:
+          script: |
+            const marker = '<!-- nix-no-daemon-patch-failed -->';
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            const existingIssue = issues.find((issue) =>
+              !issue.pull_request && issue.body?.includes(marker)
+            );
+
+            if (existingIssue) {
+              core.notice(`Failure issue is already open: ${existingIssue.html_url}`);
+              return;
+            }
+
+            const version = process.env.VERSION || 'unknown';
+            const system = process.env.SYSTEM || 'unknown';
+            const title = `Nix no-daemon patch no longer applies to ${version} (${system})`;
+            const body = [
+              marker,
+              `The scheduled patch check failed because \`no-daemon.patch\` no longer applies cleanly.`,
+              '',
+              `- Nix: ${version}`,
+              `- System: ${system}`,
+              `- Tarball: ${process.env.URL || 'unknown'}`,
+              `- Tarball SHA-256: ${process.env.TARBALL_SHA256 || 'unknown'}`,
+              `- Workflow run: ${runUrl}`,
+              '',
+              'Please refresh `no-daemon.patch` for this upstream installer.',
+            ].join('\n');
+
+            const issue = await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+            });
+
+            core.notice(`Created failure issue: ${issue.data.html_url}`);

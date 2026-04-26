@@ -1,0 +1,24 @@
+diff --git a/install b/install
+index c8c632c..596c26c 100755
+--- a/install
++++ b/install
+@@ -46,8 +46,6 @@ if [ "$OS" = "Linux" ] || [ "$OS" = "FreeBSD" ]; then
+ fi
+ 
+ case "$OS" in
+-    "Darwin")
+-        INSTALL_MODE=daemon;;
+     *)
+         INSTALL_MODE=no-daemon;;
+ esac
+@@ -62,10 +60,6 @@ while [ $# -gt 0 ]; do
+             ACTION=install
+             ;;
+         --no-daemon)
+-            if [ "$OS" = "Darwin" ]; then
+-                printf '\e[1;31mError: --no-daemon installs are no-longer supported on Darwin/macOS!\e[0m\n' >&2
+-                exit 1
+-            fi
+             INSTALL_MODE=no-daemon
+             ACTION=install
+             ;;

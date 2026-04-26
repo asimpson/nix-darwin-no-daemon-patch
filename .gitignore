@@ -1,0 +1,7 @@
+# Artifacts from the README commands
+/nix-*-darwin/
+/nix-*.tar.xz
+/check/
+
+# Local copy of the GitHub Actions cache marker, if a workflow command is tested locally
+/.patch-check-state/
